@@ -1,0 +1,349 @@
+name: Build Realme GT Neo5 SE Kernel (GKI 5.10)
+run-name: ${{ inputs.ksu_type }}${{ inputs.SUSFS && ' + SuSFS' || '' }} — GT Neo5 SE (5.10)
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.ksu_type }}-${{ inputs.SUSFS }}
+  cancel-in-progress: true
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_source:
+        type: choice
+        description: "Kernel Source Base"
+        required: true
+        default: "google_common_5_10"
+        options:
+          - "google_common_5_10"
+          - "realme_stock"
+
+      ksu_type:
+        description: "Root solution"
+        required: true
+        type: choice
+        default: "ReSukiSU"
+        options:
+          - "ReSukiSU"
+          - "KernelSU Next"
+
+      SUSFS:
+        description: "Enable SuSFS (hide environment)"
+        required: true
+        type: boolean
+        default: true
+
+      bbr_enable:
+        description: "TCP BBR Congestion Control"
+        required: true
+        type: choice
+        default: "default"
+        options:
+          - "false"
+          - "true"
+          - "default"
+
+      wireguard:
+        description: "WireGuard VPN support"
+        required: true
+        type: boolean
+        default: true
+
+      ip_set_enable:
+        description: "IP_SET support"
+        required: true
+        type: boolean
+        default: true
+
+      ttl_enable:
+        description: "TTL / Hop Limit target support"
+        required: true
+        type: boolean
+        default: true
+
+      release:
+        type: choice
+        description: "Create GitHub Release"
+        required: true
+        default: "Test"
+        options:
+          - "Release"
+          - "Test"
+
+env:
+  TZ: Asia/Shanghai
+  SUSFS_VERSION: "v1.5.12"
+  AOSP_CLANG_VERSION: "clang-r416183b"
+  GOOGLE_COMMON_REPO: "https://android.googlesource.com/kernel/common"
+  GOOGLE_COMMON_BRANCH: "android12-5.10"
+  REALME_STOCK_REPO: "https://github.com/realme-kernel-opensource/realme_GTneo5SE_5G-AndroidU-kernel-source.git"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Workflow Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Fast Disk Cleanup & Swap Allocation
+        run: |
+          # Быстрая очистка за 3 секунды без медленных apt purge
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache /usr/local/share/powershell 2>/dev/null || true
+          # Обеспечиваем 6GB swap для стабильной линковки ядра без OOM
+          sudo fallocate -l 6G /swapfile || true
+          sudo chmod 600 /swapfile || true
+          sudo mkswap /swapfile || true
+          sudo swapon /swapfile || true
+          df -h
+
+      - name: Install Essential Build Tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential curl flex git libelf-dev libssl-dev \
+            python3 zip libarchive-tools pahole tar xz-utils
+
+      - name: Download & Setup Google AOSP Clang
+        run: |
+          mkdir -p ~/clang
+          cd ~/clang
+          # Загружаем официальный Google Clang r416183b для GKI 5.10 (с запасным зеркалом)
+          GOOGLE_URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android12-release/${AOSP_CLANG_VERSION}.tar.gz"
+          MIRROR_URL="https://github.com/ravindu644/Android-Kernel-Tutorials/releases/download/v1.0.0/${AOSP_CLANG_VERSION}.tar.gz"
+
+          echo "Downloading AOSP Clang..."
+          if ! curl -fSL --retry 3 --connect-timeout 20 "$GOOGLE_URL" -o clang.tar.gz; then
+            echo "Google Git archive failed, downloading from GitHub mirror..."
+            curl -fSL --retry 3 --connect-timeout 20 "$MIRROR_URL" -o clang.tar.gz
+          fi
+          tar -xzf clang.tar.gz
+          rm -f clang.tar.gz
+          echo "$HOME/clang/bin" >> $GITHUB_PATH
+          echo "Clang version:"
+          ~/clang/bin/clang --version
+
+      - name: Clone Kernel Source
+        run: |
+          if [[ "${{ inputs.kernel_source }}" == "realme_stock" ]]; then
+            echo "Cloning Realme official kernel tree..."
+            git clone --depth=1 "${REALME_STOCK_REPO}" ~/kernel
+          else
+            echo "Cloning Upstream Google Common Kernel (${GOOGLE_COMMON_BRANCH})..."
+            git clone --depth=1 -b "${GOOGLE_COMMON_BRANCH}" "${GOOGLE_COMMON_REPO}" ~/kernel
+          fi
+
+      - name: Setup Root Solution (KernelSU / ReSukiSU)
+        id: setup_ksu
+        run: |
+          cd ~/kernel
+          if [[ "${{ inputs.ksu_type }}" == "ReSukiSU" ]]; then
+            echo "Setting up ReSukiSU..."
+            curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash -s main
+            KSU_DIR="KernelSU"
+            [[ -d "drivers/kernelsu" ]] && KSU_DIR="drivers/kernelsu"
+            echo "KSU_DIR=$KSU_DIR" >> $GITHUB_ENV
+          else
+            echo "Setting up KernelSU Next..."
+            if [[ "${{ inputs.SUSFS }}" == "true" ]]; then
+              git clone --depth=1 -b dev-susfs https://github.com/pershoot/KernelSU-Next.git KernelSU-Next
+            else
+              git clone --depth=1 https://github.com/KernelSU-Next/KernelSU-Next.git KernelSU-Next
+            fi
+            ln -sfn "$(realpath KernelSU-Next/kernel)" drivers/kernelsu || true
+            grep -q "kernelsu" drivers/Makefile || printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
+            grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig || sed -i '/endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+            echo "KSU_DIR=KernelSU-Next" >> $GITHUB_ENV
+          fi
+
+      - name: Integrate SuSFS (Kernel & KSU)
+        if: inputs.SUSFS
+        run: |
+          cd ~/kernel
+          echo "Cloning SuSFS for android12-5.10..."
+          git clone --depth=1 -b gki-android12-5.10 https://gitlab.com/simonpunk/susfs4ksu.git ~/susfs4ksu
+
+          # Копируем исходники SuSFS в ядро
+          cp -rf ~/susfs4ksu/kernel_patches/fs/* fs/
+          cp -rf ~/susfs4ksu/kernel_patches/include/linux/* include/linux/
+
+          # Применяем патч ядра SuSFS
+          if [[ -f ~/susfs4ksu/kernel_patches/50_add_susfs_in_gki-android12-5.10.patch ]]; then
+            patch -p1 --forward < ~/susfs4ksu/kernel_patches/50_add_susfs_in_gki-android12-5.10.patch || true
+          fi
+
+          # Применяем патч SuSFS для модуля KernelSU
+          KSU_TARGET="${KSU_DIR:-KernelSU}"
+          if [[ -d "$KSU_TARGET" && -f ~/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch ]]; then
+            (cd "$KSU_TARGET" && patch -p1 --forward < ~/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch) || true
+          fi
+
+      - name: Apply Realme GT Neo5 SE Patches (if present in repo)
+        run: |
+          cd ~/kernel
+          # Если в репозитории есть папка patches/, применяем все пользовательские патчи
+          if [[ -d "${GITHUB_WORKSPACE}/patches" ]]; then
+            for p in "${GITHUB_WORKSPACE}"/patches/*.patch; do
+              [[ -f "$p" ]] || continue
+              echo "Applying $p..."
+              patch -p1 --forward < "$p" || true
+            done
+          fi
+
+      - name: Configure Defconfig for Realme GT Neo5 SE
+        run: |
+          cd ~/kernel
+          DEFCONFIG="arch/arm64/configs/gki_defconfig"
+
+          add_cfg() {
+            local key="$1" value="$2"
+            sed -i "/^${key}=/d" "$DEFCONFIG" 2>/dev/null || true
+            echo "${key}=${value}" >> "$DEFCONFIG"
+          }
+
+          # 1. Специфика Realme GT Neo5 SE (RMX3700 / SM7475) и RealmeUI
+          # Обязательные атрибуты для монтирования разделов RealmeUI/ColorOS
+          add_cfg CONFIG_TMPFS_XATTR y
+          add_cfg CONFIG_TMPFS_POSIX_ACL y
+          add_cfg CONFIG_LOCALVERSION "\"-GT-Neo5-SE\""
+
+          # Отключаем строгую проверку KMI, чтобы OEM-модули Realme не отвергались при старте
+          add_cfg CONFIG_KMI_SYMBOL_LIST_STRICT_MODE n
+
+          # 2. Опции Root (KSU)
+          add_cfg CONFIG_KSU y
+          if [[ "${{ inputs.ksu_type }}" == "KernelSU Next" ]]; then
+            add_cfg CONFIG_KSU_MANUAL_HOOK y
+            add_cfg CONFIG_KSU_KPROBES_HOOK n
+          fi
+
+          # 3. SuSFS
+          if [[ "${{ inputs.SUSFS }}" == "true" ]]; then
+            cat >> "$DEFCONFIG" << 'EOF'
+          CONFIG_KSU_SUSFS=y
+          CONFIG_KSU_SUSFS_SUS_PATH=y
+          CONFIG_KSU_SUSFS_SUS_MOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_KSTAT=y
+          CONFIG_KSU_SUSFS_TRY_UMOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y
+          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+          CONFIG_KSU_SUSFS_ENABLE_LOG=y
+          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+          CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
+          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+          CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_SU=n
+          EOF
+          fi
+
+          # 4. Сетевые настройки (BBR, WireGuard, IP_SET, TTL)
+          if [[ "${{ inputs.bbr_enable }}" != "false" ]]; then
+            add_cfg CONFIG_TCP_CONG_ADVANCED y
+            add_cfg CONFIG_TCP_CONG_BBR y
+            add_cfg CONFIG_NET_SCH_FQ y
+            add_cfg CONFIG_NET_SCH_FQ_CODEL y
+            [[ "${{ inputs.bbr_enable }}" == "default" ]] && add_cfg CONFIG_DEFAULT_TCP_CONG "\"bbr\""
+          fi
+
+          if [[ "${{ inputs.wireguard }}" == "true" ]]; then
+            add_cfg CONFIG_WIREGUARD y
+          fi
+
+          if [[ "${{ inputs.ip_set_enable }}" == "true" ]]; then
+            add_cfg CONFIG_IP_SET y
+            add_cfg CONFIG_IP_SET_HASH_IP y
+            add_cfg CONFIG_IP_SET_HASH_NET y
+          fi
+
+          if [[ "${{ inputs.ttl_enable }}" == "true" ]]; then
+            add_cfg CONFIG_IP_NF_TARGET_TTL y
+            add_cfg CONFIG_IP6_NF_TARGET_HL y
+          fi
+
+          # Убираем проверки gki build config, если они присутствуют
+          sed -i 's/check_defconfig//g' build.config* 2>/dev/null || true
+
+      - name: Build Kernel Image
+        run: |
+          cd ~/kernel
+          export PATH="$HOME/clang/bin:$PATH"
+
+          echo "Generating defconfig..."
+          make -j$(nproc --all) ARCH=arm64 LLVM=1 LLVM_IAS=1 gki_defconfig
+
+          echo "Compiling Kernel (Image)..."
+          # KCFLAGS="-Wno-error" предотвращает падение компиляции из-за незначительных ворнингов
+          make -j$(nproc --all) \
+            ARCH=arm64 \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            KCFLAGS="-Wno-error" \
+            Image
+
+          if [[ ! -f "arch/arm64/boot/Image" ]]; then
+            echo "::error::Kernel Image was not generated!"
+            exit 1
+          fi
+          echo "Kernel compiled successfully!"
+
+      - name: Package with AnyKernel3 (Realme GT Neo5 SE)
+        id: package
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git ~/AnyKernel3
+          cd ~/AnyKernel3
+
+          # Настройка AnyKernel3 под Realme GT Neo5 SE (RMX3700 / sea)
+          sed -i 's/do.device.check=1/do.device.check=1/' anykernel.sh || true
+          sed -i 's/device.name1=.*/device.name1=RMX3700/' anykernel.sh || true
+          sed -i 's/device.name2=.*/device.name2=RMX3701/' anykernel.sh || true
+          sed -i 's/device.name3=.*/device.name3=sea/' anykernel.sh || true
+          sed -i 's/device.name4=.*/device.name4=GT Neo5 SE/' anykernel.sh || true
+          sed -i 's/supported.versions=.*/supported.versions=12 - 16/' anykernel.sh || true
+          sed -i 's/is_gki=0/is_gki=1/' anykernel.sh || true
+
+          # Копируем скомпилированное ядро
+          cp ~/kernel/arch/arm64/boot/Image ./Image
+
+          ZIP_NAME="AnyKernel3_GT_Neo5_SE_5.10_${{ inputs.ksu_type }}${{ inputs.SUSFS && '_SUSFS' || '' }}_$(date +%Y%m%d_%H%M).zip"
+          zip -r9 "$ZIP_NAME" ./* -x .git README.md anykernel.sh.orig
+
+          mkdir -p "${GITHUB_WORKSPACE}/out"
+          cp "$ZIP_NAME" "${GITHUB_WORKSPACE}/out/"
+          cp ./Image "${GITHUB_WORKSPACE}/out/Image"
+
+          echo "zip_name=$ZIP_NAME" >> $GITHUB_OUTPUT
+          echo "📦 Archive created: $ZIP_NAME"
+
+      - name: Upload AnyKernel3 Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.zip_name }}
+          path: out/*.zip
+
+      - name: Upload Raw Kernel Image
+        uses: actions/upload-artifact@v4
+        with:
+          name: Image-GT-Neo5-SE
+          path: out/Image
+
+      - name: Create GitHub Release
+        if: inputs.release == 'Release'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: release-${{ steps.package.outputs.zip_name }}
+          name: GT Neo5 SE 5.10 (${{ inputs.ksu_type }}${{ inputs.SUSFS && ' + SuSFS' || '' }})
+          files: out/*.zip
+          body: |
+            ### Realme GT Neo5 SE (RMX3700) GKI 5.10
+            - **Base**: Android Common Kernel (`android12-5.10`)
+            - **Compiler**: Google AOSP Clang (`clang-r416183b`)
+            - **Root Solution**: ${{ inputs.ksu_type }}
+            - **SuSFS**: ${{ inputs.SUSFS }} (${{ env.SUSFS_VERSION }})
+            - **BBR**: ${{ inputs.bbr_enable }}
+            - **WireGuard**: ${{ inputs.wireguard }}
+            - **Flasher**: AnyKernel3 (flash via KernelFlasher, TWRP, OrangeFox)
