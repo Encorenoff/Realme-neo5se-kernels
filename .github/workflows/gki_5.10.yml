@@ -17,6 +17,12 @@ on:
           - "realme_stock"
           - "google_common_5_10"
 
+      use_realme_fragment:
+        description: "google_common_5_10: apply Realme vendor/waipio_GKI.config on top of gki_defconfig"
+        required: true
+        type: boolean
+        default: true
+
       merge_google_upstream:
         description: "Merge latest Google android12-5.10 into Realme tree (only for realme_stock)"
         required: true
@@ -89,7 +95,7 @@ env:
   SUSFS_VERSION: "v1.5.12"
   AOSP_CLANG_VERSION: "clang-r416183b"
   GOOGLE_COMMON_REPO: "https://android.googlesource.com/kernel/common"
-  GOOGLE_COMMON_BRANCH: "android12-5.10-2025-05"   # 5.10.236-android12, как на устройстве
+  GOOGLE_COMMON_BRANCH: "android12-5.10"   # актуальный tip Google (релизные ветки-снимки на googlesource доступны только как теги)
   GOOGLE_BASE_TAG_PREFIX: "android12-5.10-2025-05_r"   # релизные теги Google, 5.10.236 (база Realme)
   GOOGLE_UPSTREAM_BRANCH: "android12-5.10"       # актуальный tip Google
   REALME_STOCK_REPO: "https://github.com/realme-kernel-opensource/realme_GTNeo5SE-AndroidB-kernel-source.git"
@@ -273,6 +279,36 @@ jobs:
             done
           fi
 
+      - name: Stub missing Oplus/Qualcomm sources (realme_stock)
+        if: inputs.kernel_source == 'realme_stock'
+        run: |
+          set -euo pipefail
+          cd ~/kernel
+          # Репозиторий Realme содержит символические ссылки на vendor/oplus и qcom/proprietary,
+          # которые не публикуются. Без заглушек Kconfig падает (kernel/oplus_cpu/sched/Kconfig).
+          # 1) Битые симлинки (на vendor/oplus, qcom/proprietary и т.п.) заменяем заглушками:
+          #    для каталогов - пустой каталог с пустыми Kconfig/Makefile, для файлов (*.h и т.п.) - пустой файл.
+          for pass in 1 2 3 4 5; do
+            mapfile -t LINKS < <(find . -path ./.git -prune -o -xtype l -print)
+            [[ ${#LINKS[@]} -eq 0 ]] && break
+            for l in "${LINKS[@]}"; do
+              target="$(readlink "$l")"
+              rm -f -- "$l"
+              if [[ "$target" == */ || "$(basename "$l")" != *.* ]]; then
+                mkdir -p -- "$l"; : > "$l/Kconfig"; : > "$l/Makefile"
+              else
+                : > "$l"
+              fi
+            done
+            echo "pass $pass: stubbed ${#LINKS[@]} dangling symlinks"
+          done
+          # 2) Прочие 'source "..."' в Kconfig на несуществующие файлы
+          mapfile -t SRC < <(grep -rhoE --include='Kconfig*' '^[[:space:]]*source[[:space:]]+"[^"$]+"' . | sed -E 's/^[[:space:]]*source[[:space:]]+"//; s/"$//' | sort -u)
+          for f in "${SRC[@]}"; do
+            [[ -e "$f" ]] || { mkdir -p -- "$(dirname "$f")"; : > "$f"; echo "stubbed missing Kconfig: $f"; }
+          done
+          echo "Remaining dangling symlinks: $(find . -path ./.git -prune -o -xtype l -print | wc -l)"
+
       - name: Configure Defconfig for Realme GT Neo5 SE
         run: |
           cd ~/kernel
@@ -280,6 +316,13 @@ jobs:
           if [[ "${{ inputs.kernel_source }}" == "realme_stock" ]]; then
             # Как в стоковой сборке Qualcomm/Realme: gki_defconfig + vendor/waipio_GKI.config
             cat arch/arm64/configs/gki_defconfig arch/arm64/configs/vendor/waipio_GKI.config \
+              > arch/arm64/configs/waipio-gki_defconfig
+            DEFCONFIG_NAME="waipio-gki_defconfig"
+          elif [[ "${{ inputs.use_realme_fragment }}" == "true" ]]; then
+            # Чистый Google-апстрим + конфиг Realme: берём только waipio_GKI.config из репозитория Realme
+            git clone --depth=1 --filter=blob:none --no-checkout "${REALME_STOCK_REPO}" ~/realme_cfg
+            git -C ~/realme_cfg checkout HEAD -- arch/arm64/configs/vendor/waipio_GKI.config
+            cat arch/arm64/configs/gki_defconfig ~/realme_cfg/arch/arm64/configs/vendor/waipio_GKI.config \
               > arch/arm64/configs/waipio-gki_defconfig
             DEFCONFIG_NAME="waipio-gki_defconfig"
           fi
