@@ -318,14 +318,24 @@ jobs:
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git ~/AnyKernel3
           cd ~/AnyKernel3
 
-          # Конфигурация AnyKernel3 под Realme GT Neo5 SE (RMX3700 / sea)
-          sed -i 's/do.device.check=1/do.device.check=1/' anykernel.sh || true
-          sed -i 's/device.name1=.*/device.name1=RMX3700/' anykernel.sh || true
-          sed -i 's/device.name2=.*/device.name2=RMX3701/' anykernel.sh || true
-          sed -i 's/device.name3=.*/device.name3=sea/' anykernel.sh || true
-          sed -i 's/device.name4=.*/device.name4=GT Neo5 SE/' anykernel.sh || true
-          sed -i 's/supported.versions=.*/supported.versions=12 - 16/' anykernel.sh || true
-          sed -i 's/is_gki=0/is_gki=1/' anykernel.sh || true
+          # Конфигурация AnyKernel3 под Realme GT Neo5 SE (A/B, GKI boot.img)
+          # Поддерживаются и верхний (BLOCK=), и нижний (block=) регистр ключей
+          sed -i -E 's|^(BLOCK\|block)=.*|\1=boot;|'                       anykernel.sh
+          sed -i -E 's|^(IS_SLOT_DEVICE\|is_slot_device)=.*|\1=auto;|'     anykernel.sh
+          sed -i -E 's|^(RAMDISK_COMPRESSION\|ramdisk_compression)=.*|\1=auto;|' anykernel.sh
+          sed -i -E 's|^(PATCH_VBMETA_FLAG\|patch_vbmeta_flag)=.*|\1=auto;|' anykernel.sh
+
+          # Проверку устройства отключаем: кодовые имена модели могут не совпасть
+          sed -i -E 's|^do\.devicecheck=.*|do.devicecheck=0|'  anykernel.sh
+          sed -i -E 's|^do\.modules=.*|do.modules=0|'          anykernel.sh
+          sed -i -E 's|^kernel\.string=.*|kernel.string=GT Neo5 SE GKI 5.10 (${{ inputs.ksu_type }})|' anykernel.sh
+
+          echo "=== anykernel.sh properties ==="
+          grep -nE "^(BLOCK|block|IS_SLOT_DEVICE|is_slot_device|RAMDISK_COMPRESSION|ramdisk_compression|PATCH_VBMETA_FLAG|patch_vbmeta_flag|do\.|kernel\.string)" anykernel.sh || true
+          if ! grep -qE "^(BLOCK|block)=boot;" anykernel.sh; then
+            echo "::error::Failed to set boot partition in anykernel.sh"
+            exit 1
+          fi
 
           cp ~/kernel/arch/arm64/boot/Image ./Image
 
