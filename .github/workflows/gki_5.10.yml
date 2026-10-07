@@ -92,12 +92,16 @@ jobs:
       - name: Fast Disk Cleanup & Swap Check
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache /usr/local/share/powershell 2>/dev/null || true
-          if ! swapon --show | grep -q "swap"; then
-            sudo fallocate -l 6G /swapfile_extra || true
+          
+          # Выделяем гарантированные 8GB Swap через dd
+          if ! swapon --show | grep -q "/swapfile_extra"; then
+            echo "Создание дополнительного swap-файла..."
+            sudo dd if=/dev/zero of=/swapfile_extra bs=1M count=8192 status=none || true
             sudo chmod 600 /swapfile_extra || true
             sudo mkswap /swapfile_extra || true
             sudo swapon /swapfile_extra || true
           fi
+          free -h
           df -h
 
       - name: Install Essential Build Tools
@@ -189,6 +193,7 @@ jobs:
           add_cfg() {
             local key="$1" value="$2"
             sed -i "/^${key}=/d" "$DEFCONFIG" 2>/dev/null || true
+            sed -i "/^# ${key} is not set/d" "$DEFCONFIG" 2>/dev/null || true
             echo "${key}=${value}" >> "$DEFCONFIG"
           }
 
@@ -200,6 +205,11 @@ jobs:
           # Отключаем строгую валидацию KMI ABI для загрузки вендорных драйверов Realme
           add_cfg CONFIG_KMI_SYMBOL_LIST_STRICT_MODE n
 
+          # Отключаем Full LTO во избежание OOM и зависания линковщика (vmlinux) на GitHub Actions
+          sed -i 's/CONFIG_LTO_CLANG_FULL=y/CONFIG_LTO_NONE=y/' "$DEFCONFIG" 2>/dev/null || true
+          sed -i '/CONFIG_LTO_CLANG_THIN=y/d' "$DEFCONFIG" 2>/dev/null || true
+          add_cfg CONFIG_LTO_NONE y
+
           # KSU опции
           add_cfg CONFIG_KSU y
           if [[ "${{ inputs.ksu_type }}" == "KernelSU Next" ]]; then
@@ -210,22 +220,22 @@ jobs:
           # SuSFS опции
           if [[ "${{ inputs.SUSFS }}" == "true" ]]; then
             cat >> "$DEFCONFIG" << 'EOF'
-          CONFIG_KSU_SUSFS=y
-          CONFIG_KSU_SUSFS_SUS_PATH=y
-          CONFIG_KSU_SUSFS_SUS_MOUNT=y
-          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y
-          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y
-          CONFIG_KSU_SUSFS_SUS_KSTAT=y
-          CONFIG_KSU_SUSFS_TRY_UMOUNT=y
-          CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y
-          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
-          CONFIG_KSU_SUSFS_ENABLE_LOG=y
-          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
-          CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
-          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
-          CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y
-          CONFIG_KSU_SUSFS_SUS_SU=n
-          EOF
+CONFIG_KSU_SUSFS=y
+CONFIG_KSU_SUSFS_SUS_PATH=y
+CONFIG_KSU_SUSFS_SUS_MOUNT=y
+CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y
+CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y
+CONFIG_KSU_SUSFS_SUS_KSTAT=y
+CONFIG_KSU_SUSFS_TRY_UMOUNT=y
+CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y
+CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+CONFIG_KSU_SUSFS_ENABLE_LOG=y
+CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
+CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y
+CONFIG_KSU_SUSFS_SUS_SU=n
+EOF
           fi
 
           # Сетевые настройки (BBR, WireGuard, IP_SET, TTL)
@@ -266,6 +276,15 @@ jobs:
             LLVM=1 \
             LLVM_IAS=1 \
             gki_defconfig
+
+          # Финализация отключения LTO в сгенерированном .config
+          ./scripts/config -d LTO_CLANG_FULL -d LTO_CLANG_THIN -e LTO_NONE
+          make -j$(nproc --all) \
+            ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            olddefconfig
 
           echo "Compiling Kernel (Image)..."
           make -j$(nproc --all) \
