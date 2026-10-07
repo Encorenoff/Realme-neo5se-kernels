@@ -90,7 +90,7 @@ env:
   AOSP_CLANG_VERSION: "clang-r416183b"
   GOOGLE_COMMON_REPO: "https://android.googlesource.com/kernel/common"
   GOOGLE_COMMON_BRANCH: "android12-5.10-2025-05"   # 5.10.236-android12, как на устройстве
-  GOOGLE_BASE_BRANCH: "android12-5.10-2025-05"   # база Realme: 5.10.236
+  GOOGLE_BASE_TAG_PREFIX: "android12-5.10-2025-05_r"   # релизные теги Google, 5.10.236 (база Realme)
   GOOGLE_UPSTREAM_BRANCH: "android12-5.10"       # актуальный tip Google
   REALME_STOCK_REPO: "https://github.com/realme-kernel-opensource/realme_GTNeo5SE-AndroidB-kernel-source.git"
   REALME_STOCK_BRANCH: "master"   # 5.10.236, RMX3700 16.0.1.301
@@ -167,9 +167,30 @@ jobs:
           echo "Realme base before merge:"; grep -E "^(VERSION|PATCHLEVEL|SUBLEVEL)" Makefile | tr '\n' ' '; echo
           git config user.name "ci"; git config user.email "ci@localhost"
           git config merge.renames false
-          fetch_ref() { for i in 1 2 3; do git fetch --depth=1 --no-tags "$GOOGLE_COMMON_REPO" "refs/heads/$1:refs/google/$2" && return 0; sleep 10; done; return 1; }
-          fetch_ref "$GOOGLE_BASE_BRANCH" base
-          fetch_ref "$GOOGLE_UPSTREAM_BRANCH" tip
+          fetch_ref() { # $1 = полный ref (refs/heads/... или refs/tags/...), $2 = локальное имя
+            for i in 1 2 3; do
+              git fetch --depth=1 --no-tags "$GOOGLE_COMMON_REPO" "$1:refs/google/$2" && return 0
+              sleep 10
+            done
+            return 1
+          }
+
+          # База: релизные теги android12-5.10-2025-05_rN (все 5.10.236). Берём первый найденный.
+          BASE_FOUND=""
+          for n in 8 9 7 6 5 4 3 2 1; do
+            if git fetch --depth=1 --no-tags "$GOOGLE_COMMON_REPO" \
+                 "refs/tags/${GOOGLE_BASE_TAG_PREFIX}${n}:refs/google/base" 2>/dev/null; then
+              BASE_FOUND="${GOOGLE_BASE_TAG_PREFIX}${n}"; break
+            fi
+          done
+          if [[ -z "$BASE_FOUND" ]]; then
+            echo "::error::None of the tags ${GOOGLE_BASE_TAG_PREFIX}{1..9} found in ${GOOGLE_COMMON_REPO}"
+            exit 1
+          fi
+          echo "Google base tag: ${BASE_FOUND}"
+          fetch_ref "refs/heads/${GOOGLE_UPSTREAM_BRANCH}" tip
+          echo "Google base version:"; git show refs/google/base:Makefile | grep -E "^(VERSION|PATCHLEVEL|SUBLEVEL)" | tr '\n' ' '; echo
+          echo "Google tip version:";  git show refs/google/tip:Makefile  | grep -E "^(VERSION|PATCHLEVEL|SUBLEVEL)" | tr '\n' ' '; echo
           BASE=$(git commit-tree "refs/google/base^{tree}" -m "google base")
           THEIRS=$(git commit-tree "refs/google/tip^{tree}" -p "$BASE" -m "google tip")
           OURS=$(git commit-tree "HEAD^{tree}" -p "$BASE" -m "realme")
@@ -196,7 +217,7 @@ jobs:
           echo "Kernel version after merge:"; grep -E "^(VERSION|PATCHLEVEL|SUBLEVEL)" Makefile | tr '\n' ' '; echo
           {
             echo "### Google upstream merge"
-            echo "- base: \`${GOOGLE_BASE_BRANCH}\` → upstream: \`${GOOGLE_UPSTREAM_BRANCH}\`"
+            echo "- base: \`${BASE_FOUND}\` → upstream: \`${GOOGLE_UPSTREAM_BRANCH}\`"
             echo "- conflicting paths resolved in favour of Realme (--ours): ${#UNMERGED[@]}"
             printf '%s\n' "${UNMERGED[@]:0:50}" | sed 's/^/  - /'
           } >> "$GITHUB_STEP_SUMMARY"
