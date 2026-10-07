@@ -12,10 +12,25 @@ on:
         type: choice
         description: "Kernel Source Base"
         required: true
-        default: "google_common_5_10"
+        default: "realme_stock"
         options:
-          - "google_common_5_10"
           - "realme_stock"
+          - "google_common_5_10"
+
+      merge_google_upstream:
+        description: "Merge latest Google android12-5.10 into Realme tree (only for realme_stock)"
+        required: true
+        type: boolean
+        default: true
+
+      lto:
+        type: choice
+        description: "LTO mode (thin = CFI kept, like stock; none = least RAM, CFI off)"
+        required: true
+        default: "thin"
+        options:
+          - "thin"
+          - "none"
 
       ksu_type:
         description: "Root solution"
@@ -74,8 +89,11 @@ env:
   SUSFS_VERSION: "v1.5.12"
   AOSP_CLANG_VERSION: "clang-r416183b"
   GOOGLE_COMMON_REPO: "https://android.googlesource.com/kernel/common"
-  GOOGLE_COMMON_BRANCH: "android12-5.10"
-  REALME_STOCK_REPO: "https://github.com/realme-kernel-opensource/realme_GTneo5SE_5G-AndroidU-kernel-source.git"
+  GOOGLE_COMMON_BRANCH: "android12-5.10-2025-05"   # 5.10.236-android12, как на устройстве
+  GOOGLE_BASE_BRANCH: "android12-5.10-2025-05"   # база Realme: 5.10.236
+  GOOGLE_UPSTREAM_BRANCH: "android12-5.10"       # актуальный tip Google
+  REALME_STOCK_REPO: "https://github.com/realme-kernel-opensource/realme_GTNeo5SE-AndroidB-kernel-source.git"
+  REALME_STOCK_BRANCH: "master"   # 5.10.236, RMX3700 16.0.1.301
 
 permissions:
   contents: write
@@ -134,11 +152,54 @@ jobs:
         run: |
           if [[ "${{ inputs.kernel_source }}" == "realme_stock" ]]; then
             echo "Cloning Realme official kernel tree..."
-            git clone --depth=1 "${REALME_STOCK_REPO}" ~/kernel
+            git clone --depth=1 -b "${REALME_STOCK_BRANCH}" "${REALME_STOCK_REPO}" ~/kernel
+            grep -E "^(VERSION|PATCHLEVEL|SUBLEVEL)" ~/kernel/Makefile
           else
-            echo "Cloning Upstream Google Common Kernel (${GOOGLE_COMMON_BRANCH})..."
+            echo "Cloning Google Common Kernel (${GOOGLE_COMMON_BRANCH})..."
             git clone --depth=1 -b "${GOOGLE_COMMON_BRANCH}" "${GOOGLE_COMMON_REPO}" ~/kernel
           fi
+
+      - name: Merge latest Google upstream into Realme tree
+        if: inputs.kernel_source == 'realme_stock' && inputs.merge_google_upstream
+        run: |
+          set -euo pipefail
+          cd ~/kernel
+          echo "Realme base before merge:"; grep -E "^(VERSION|PATCHLEVEL|SUBLEVEL)" Makefile | tr '\n' ' '; echo
+          git config user.name "ci"; git config user.email "ci@localhost"
+          git config merge.renames false
+          fetch_ref() { for i in 1 2 3; do git fetch --depth=1 --no-tags "$GOOGLE_COMMON_REPO" "refs/heads/$1:refs/google/$2" && return 0; sleep 10; done; return 1; }
+          fetch_ref "$GOOGLE_BASE_BRANCH" base
+          fetch_ref "$GOOGLE_UPSTREAM_BRANCH" tip
+          BASE=$(git commit-tree "refs/google/base^{tree}" -m "google base")
+          THEIRS=$(git commit-tree "refs/google/tip^{tree}" -p "$BASE" -m "google tip")
+          OURS=$(git commit-tree "HEAD^{tree}" -p "$BASE" -m "realme")
+          git checkout -q -B merged "$OURS"
+          set +e
+          git merge --no-edit -X ours "$THEIRS" > $RUNNER_TEMP/merge.log 2>&1
+          rc=$?
+          set -e
+          mapfile -t UNMERGED < <(git diff --name-only --diff-filter=U)
+          for f in "${UNMERGED[@]}"; do
+            [[ -n "$f" ]] || continue
+            if git checkout --ours -- "$f" 2>/dev/null; then git add -- "$f"; else git rm -q --cached -- "$f" 2>/dev/null || true; rm -f -- "$f"; fi
+          done
+          if [[ -f .git/MERGE_HEAD ]]; then git commit -q --no-edit; fi
+          echo "merge rc=$rc, unmerged-resolved=${#UNMERGED[@]}"
+          if ! git merge-base --is-ancestor "$THEIRS" HEAD; then
+            echo "::error::Google upstream merge failed (not an ancestor of HEAD):"
+            cat "$RUNNER_TEMP/merge.log"
+            exit 1
+          fi
+          git diff --shortstat "$OURS" HEAD
+
+          echo "=== Merge log (tail) ==="; tail -n 40 "$RUNNER_TEMP/merge.log" || true
+          echo "Kernel version after merge:"; grep -E "^(VERSION|PATCHLEVEL|SUBLEVEL)" Makefile | tr '\n' ' '; echo
+          {
+            echo "### Google upstream merge"
+            echo "- base: \`${GOOGLE_BASE_BRANCH}\` → upstream: \`${GOOGLE_UPSTREAM_BRANCH}\`"
+            echo "- conflicting paths resolved in favour of Realme (--ours): ${#UNMERGED[@]}"
+            printf '%s\n' "${UNMERGED[@]:0:50}" | sed 's/^/  - /'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Setup Root Solution (KernelSU / ReSukiSU)
         run: |
@@ -174,6 +235,12 @@ jobs:
             patch -p1 --forward --batch < ~/susfs4ksu/kernel_patches/50_add_susfs_in_gki-android12-5.10.patch || true
           fi
 
+          # Патч SuSFS сделан под tip ветки; на более старой базе возможны отказы (.rej)
+          if find . -name '*.rej' | grep -q .; then
+            echo "::warning::SuSFS patch has rejected hunks on this kernel base:"
+            find . -name '*.rej'
+          fi
+
       - name: Apply Realme GT Neo5 SE Patches (if present)
         run: |
           cd ~/kernel
@@ -188,7 +255,15 @@ jobs:
       - name: Configure Defconfig for Realme GT Neo5 SE
         run: |
           cd ~/kernel
-          DEFCONFIG="arch/arm64/configs/gki_defconfig"
+          DEFCONFIG_NAME="gki_defconfig"
+          if [[ "${{ inputs.kernel_source }}" == "realme_stock" ]]; then
+            # Как в стоковой сборке Qualcomm/Realme: gki_defconfig + vendor/waipio_GKI.config
+            cat arch/arm64/configs/gki_defconfig arch/arm64/configs/vendor/waipio_GKI.config \
+              > arch/arm64/configs/waipio-gki_defconfig
+            DEFCONFIG_NAME="waipio-gki_defconfig"
+          fi
+          echo "DEFCONFIG_NAME=${DEFCONFIG_NAME}" >> "$GITHUB_ENV"
+          DEFCONFIG="arch/arm64/configs/${DEFCONFIG_NAME}"
 
           add_cfg() {
             local key="$1" value="$2"
@@ -205,10 +280,14 @@ jobs:
           # Отключаем строгую валидацию KMI ABI для загрузки вендорных драйверов Realme
           add_cfg CONFIG_KMI_SYMBOL_LIST_STRICT_MODE n
 
-          # Отключаем Full LTO во избежание OOM и зависания линковщика (vmlinux) на GitHub Actions
-          sed -i 's/CONFIG_LTO_CLANG_FULL=y/CONFIG_LTO_NONE=y/' "$DEFCONFIG" 2>/dev/null || true
-          sed -i '/CONFIG_LTO_CLANG_THIN=y/d' "$DEFCONFIG" 2>/dev/null || true
-          add_cfg CONFIG_LTO_NONE y
+          # Full LTO в gki_defconfig не влезает в память раннера (OOM при линковке vmlinux).
+          # thin: сохраняем CFI/SCS, как в стоке; none: минимум памяти, но CFI отключается.
+          sed -i '/^CONFIG_LTO_CLANG_FULL=/d; /^CONFIG_LTO_CLANG_THIN=/d; /^CONFIG_LTO_NONE=/d; /^# CONFIG_LTO_/d' "$DEFCONFIG"
+          if [[ "${{ inputs.lto }}" == "thin" ]]; then
+            add_cfg CONFIG_LTO_CLANG_THIN y
+          else
+            add_cfg CONFIG_LTO_NONE y
+          fi
 
           # KSU опции
           add_cfg CONFIG_KSU y
@@ -219,23 +298,25 @@ jobs:
 
           # SuSFS опции
           if [[ "${{ inputs.SUSFS }}" == "true" ]]; then
-            cat >> "$DEFCONFIG" << 'EOF'
-CONFIG_KSU_SUSFS=y
-CONFIG_KSU_SUSFS_SUS_PATH=y
-CONFIG_KSU_SUSFS_SUS_MOUNT=y
-CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y
-CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y
-CONFIG_KSU_SUSFS_SUS_KSTAT=y
-CONFIG_KSU_SUSFS_TRY_UMOUNT=y
-CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y
-CONFIG_KSU_SUSFS_SPOOF_UNAME=y
-CONFIG_KSU_SUSFS_ENABLE_LOG=y
-CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
-CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
-CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
-CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y
-CONFIG_KSU_SUSFS_SUS_SU=n
-EOF
+            for opt in \
+              CONFIG_KSU_SUSFS=y \
+              CONFIG_KSU_SUSFS_SUS_PATH=y \
+              CONFIG_KSU_SUSFS_SUS_MOUNT=y \
+              CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y \
+              CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y \
+              CONFIG_KSU_SUSFS_SUS_KSTAT=y \
+              CONFIG_KSU_SUSFS_TRY_UMOUNT=y \
+              CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y \
+              CONFIG_KSU_SUSFS_SPOOF_UNAME=y \
+              CONFIG_KSU_SUSFS_ENABLE_LOG=y \
+              CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y \
+              CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y \
+              CONFIG_KSU_SUSFS_OPEN_REDIRECT=y \
+              CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y \
+              CONFIG_KSU_SUSFS_SUS_SU=n
+            do
+              add_cfg "${opt%%=*}" "${opt#*=}"
+            done
           fi
 
           # Сетевые настройки (BBR, WireGuard, IP_SET, TTL)
@@ -275,16 +356,28 @@ EOF
             CROSS_COMPILE=aarch64-linux-gnu- \
             LLVM=1 \
             LLVM_IAS=1 \
-            gki_defconfig
+            "${DEFCONFIG_NAME}"
 
-          # Финализация отключения LTO в сгенерированном .config
-          ./scripts/config -d LTO_CLANG_FULL -d LTO_CLANG_THIN -e LTO_NONE
+          if [[ "${{ inputs.lto }}" == "thin" ]]; then
+            ./scripts/config -d LTO_CLANG_FULL -d LTO_NONE -e LTO_CLANG_THIN
+          else
+            ./scripts/config -d LTO_CLANG_FULL -d LTO_CLANG_THIN -e LTO_NONE \
+                             -d CFI_CLANG -d CFI_PERMISSIVE
+          fi
           make -j$(nproc --all) \
             ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
             LLVM=1 \
             LLVM_IAS=1 \
             olddefconfig
+
+          echo "=== LTO/CFI/SCS state in final .config ==="
+          grep -E "^(# )?CONFIG_(LTO|CFI|SHADOW_CALL_STACK)" .config || true
+          if grep -q "^CONFIG_LTO_CLANG_FULL=y" .config; then
+            echo "::error::Full LTO is still enabled (OOM risk at vmlinux link)"
+            exit 1
+          fi
+          free -h
 
           echo "Compiling Kernel (Image)..."
           make -j$(nproc --all) \
@@ -307,18 +400,29 @@ EOF
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git ~/AnyKernel3
           cd ~/AnyKernel3
 
-          # Конфигурация AnyKernel3 под Realme GT Neo5 SE (RMX3700 / sea)
-          sed -i 's/do.device.check=1/do.device.check=1/' anykernel.sh || true
-          sed -i 's/device.name1=.*/device.name1=RMX3700/' anykernel.sh || true
-          sed -i 's/device.name2=.*/device.name2=RMX3701/' anykernel.sh || true
-          sed -i 's/device.name3=.*/device.name3=sea/' anykernel.sh || true
-          sed -i 's/device.name4=.*/device.name4=GT Neo5 SE/' anykernel.sh || true
-          sed -i 's/supported.versions=.*/supported.versions=12 - 16/' anykernel.sh || true
-          sed -i 's/is_gki=0/is_gki=1/' anykernel.sh || true
+          # Конфигурация AnyKernel3 под Realme GT Neo5 SE (A/B, GKI boot.img)
+          # Поддерживаются и верхний (BLOCK=), и нижний (block=) регистр ключей
+          sed -i -E 's|^(BLOCK\|block)=.*|\1=boot;|'                       anykernel.sh
+          sed -i -E 's|^(IS_SLOT_DEVICE\|is_slot_device)=.*|\1=auto;|'     anykernel.sh
+          sed -i -E 's|^(RAMDISK_COMPRESSION\|ramdisk_compression)=.*|\1=auto;|' anykernel.sh
+          sed -i -E 's|^(PATCH_VBMETA_FLAG\|patch_vbmeta_flag)=.*|\1=auto;|' anykernel.sh
+
+          # Проверку устройства отключаем: кодовые имена модели могут не совпасть
+          sed -i -E 's|^do\.devicecheck=.*|do.devicecheck=0|'  anykernel.sh
+          sed -i -E 's|^do\.modules=.*|do.modules=0|'          anykernel.sh
+          sed -i -E 's|^kernel\.string=.*|kernel.string=GT Neo5 SE GKI 5.10 (${{ inputs.ksu_type }})|' anykernel.sh
+
+          echo "=== anykernel.sh properties ==="
+          grep -nE "^(BLOCK|block|IS_SLOT_DEVICE|is_slot_device|RAMDISK_COMPRESSION|ramdisk_compression|PATCH_VBMETA_FLAG|patch_vbmeta_flag|do\.|kernel\.string)" anykernel.sh || true
+          if ! grep -qE "^(BLOCK|block)=boot;" anykernel.sh; then
+            echo "::error::Failed to set boot partition in anykernel.sh"
+            exit 1
+          fi
 
           cp ~/kernel/arch/arm64/boot/Image ./Image
 
-          ZIP_NAME="AnyKernel3_GT_Neo5_SE_5.10_${{ inputs.ksu_type }}${{ inputs.SUSFS && '_SUSFS' || '' }}_$(date +%Y%m%d_%H%M).zip"
+          KSU_TAG="$(echo "${{ inputs.ksu_type }}" | tr ' ' '_')"
+          ZIP_NAME="AnyKernel3_GT_Neo5_SE_5.10_${KSU_TAG}${{ inputs.SUSFS && '_SUSFS' || '' }}_$(date +%Y%m%d_%H%M).zip"
           zip -r9 "$ZIP_NAME" ./* -x .git README.md anykernel.sh.orig
 
           mkdir -p "${GITHUB_WORKSPACE}/out"
